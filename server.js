@@ -66,6 +66,10 @@ wss.on("connection", (ws) => {
       raum.set(ws.id, ws);
       ws.raum = code;
       senden(ws, { t: "joined", code, id: ws.id, peers });
+    } else if (m.t === "list" && !ws.raum) {
+      const liste = [];
+      for (const [code, raum] of raeume) liste.push({ code, n: raum.size });
+      senden(ws, { t: "rooms", list: liste });
     } else if (m.t === "msg" && ws.raum) {
       const raum = raeume.get(ws.raum);
       if (!raum) return;
