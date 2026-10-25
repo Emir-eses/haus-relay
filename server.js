@@ -139,6 +139,35 @@ function logBegrenzt(ip, art, daten) {
   else e.unterdrueckt++;
 }
 
+// Aufrufe von Startseite / Status / Protokoll-Seite als "Besuche": jeder Besuch wird einzeln protokolliert
+// (Beginn sofort mit IP/Ort/Programm/Benutzer, Ende mit Anzahl Aufrufe). Aufrufe derselben IP auf derselben Seite
+// mit weniger als `pause` Abstand (z. B. das automatische Neuladen der Protokoll-Seite) gehoeren zum selben Besuch.
+const webBesuche = new Map(); // ip|art|pfad -> { b, n, start, letzt, pause }
+function webAufruf(ip, art, pfad, req, pause, benutzer) {
+  const k = ip + "|" + art + "|" + pfad;
+  const jetzt = Date.now();
+  const v = webBesuche.get(k);
+  if (v && jetzt - v.letzt < v.pause) { v.n++; v.letzt = jetzt; uebGeaendert = true; return; }
+  if (v) webEnde(v);
+  const z = new Date(jetzt).toISOString();
+  const b = k + "|" + z;
+  if (webBesuche.size > 5000) { for (const x of webBesuche.values()) webEnde(x); }
+  webBesuche.set(k, { b, n: 1, start: jetzt, letzt: jetzt, pause: pause || 10 * 60000 });
+  log(art, {
+    ip, b, pfad: String(pfad).slice(0, 60), methode: String(req.method).slice(0, 10), benutzer,
+    ua: String(req.headers["user-agent"] || "").slice(0, 200), geo: geo(ip),
+  });
+}
+function webEnde(v) {
+  for (const [k, x] of webBesuche) if (x === v) webBesuche.delete(k);
+  log("web_ende", { b: v.b, anzahl: v.n, bis: new Date(v.letzt).toISOString(), dauer_s: Math.round((v.letzt - v.start) / 1000) });
+}
+// abgelaufene Besuche jede Minute abschliessen
+setInterval(() => {
+  const jetzt = Date.now();
+  for (const v of [...webBesuche.values()]) if (jetzt - v.letzt >= v.pause) webEnde(v);
+}, 60000).unref();
+
 function geo(ip) {
   if (!geoip || typeof ip !== "string") return undefined;
   ip = ip.replace(/^::ffff:/, "");
@@ -229,9 +258,13 @@ function httpServer(wssX, okPfade, mitProtokoll) {
   const srv = http.createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
     const ip = ipVon(req);
     if (mitProtokoll && String(req.url).split("?")[0].startsWith("/protokoll")) return protokollSeite(req, res, ip);
-    if (mitProtokoll && req.method === "GET" && String(req.url).split("?")[0] === "/status") return statusSeite(res);
+    if (mitProtokoll && req.method === "GET" && String(req.url).split("?")[0] === "/status") {
+      webAufruf(ip, "web_aufruf", "/status", req);
+      return statusSeite(res);
+    }
     // GET und HEAD (Render prueft per HEAD /, ob der Dienst laeuft)
     if ((req.method === "GET" || req.method === "HEAD") && okPfade.indexOf(String(req.url).split("?")[0]) >= 0) {
+      webAufruf(ip, "web_aufruf", (mitProtokoll ? "" : "WD ") + String(req.url).split("?")[0], req);
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(req.method === "HEAD" ? undefined : "ok");
       return;
@@ -399,6 +432,7 @@ function protokollSeite(req, res, ip) {
   const jetzt = Date.now();
   let f = pwFehler.get(ip);
   if (f && f.bis > jetzt) {
+    webAufruf(ip, "protokoll_gesperrt", "/protokoll", req, 2 * 60000);
     res.writeHead(429, Object.assign({ "Content-Type": "text/plain; charset=utf-8" }, sicher));
     return res.end("Zu viele Fehlversuche – bitte spaeter nochmal.");
   }
@@ -419,11 +453,12 @@ function protokollSeite(req, res, ip) {
         if (f.n >= 5) {
           f.bis = jetzt + 15 * 60000;
           ipEintrag(ip).auffaellig = true;
-          logBegrenzt(ip, "abgelehnt", { grund: "Protokoll-Seite: 5 Fehlversuche – 15 min gesperrt", geo: geo(ip) });
+          logBegrenzt(ip, "abgelehnt", { grund: "Protokoll-Seite: 5 Fehlversuche – 15 min gesperrt", geo: geo(ip), ua: String(req.headers["user-agent"] || "").slice(0, 200) });
         }
       }
     }
   }
+  if (!ok && !auth) webAufruf(ip, "protokoll_ohne_login", "/protokoll", req, 2 * 60000);
   if (!ok) {
     res.writeHead(401, Object.assign({ "WWW-Authenticate": 'Basic realm="Relay-Protokoll", charset="UTF-8"', "Content-Type": "text/plain; charset=utf-8" }, sicher));
     return res.end("Anmeldung noetig.");
@@ -444,10 +479,7 @@ function protokollSeite(req, res, ip) {
     return res.end("not found");
   }
   const tag = m[1] || heute();
-  if (!ipEintrag(ip).protokollGeloggt || jetzt - ipEintrag(ip).protokollGeloggt > 30 * 60000) {
-    ipEintrag(ip).protokollGeloggt = jetzt;
-    log("protokoll_zugriff", { ip, geo: geo(ip) });
-  }
+  webAufruf(ip, "protokoll_zugriff", "/protokoll", req, 2 * 60000, PW_USER);
   const tage = protokollTage();
   const knoepfe = tage.map((t) => '<a class="' + (t === tag ? "an" : "") + '" href="/protokoll/' + t + '">' + t.slice(8, 10) + "." + t.slice(5, 7) + ".</a>").join(" ");
   const html = '<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
@@ -926,6 +958,8 @@ function liveDaten() {
   const m = new Map();
   const jetzt = Date.now();
   for (const ws of alleClients()) if (ws.sk) m.set(ws.sk, { dauer_s: Math.round((jetzt - ws.start) / 1000), kb: Math.round(ws.bytes / 1024) });
+  m.web = new Map();
+  for (const v of webBesuche.values()) m.web.set(v.b, { n: v.n, letzt: new Date(v.letzt).toISOString() });
   return m;
 }
 
@@ -979,6 +1013,7 @@ function beenden(signal) {
     });
     ws.beendetProtokolliert = true;
   }
+  for (const v of [...webBesuche.values()]) webEnde(v);
   log("stopp", { signal });
   uebGeaendert = true;
   uebersichtSchreiben();

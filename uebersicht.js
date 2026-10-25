@@ -39,6 +39,36 @@ function spiel(g) {
   return g ? SPIELNAMEN[g] || g : KEINE;
 }
 
+const WEB_ARTEN = {
+  protokoll_zugriff: "✅ angemeldet",
+  protokoll_ohne_login: "Login-Fenster aufgerufen",
+  protokoll_falsch: "❌ falsches Passwort",
+  protokoll_sperre: "⛔ 5 Fehlversuche → gesperrt",
+  protokoll_gesperrt: "⛔ Aufruf während Sperre",
+};
+function seitenName(p) {
+  const x = String(p || "");
+  if (x === "/" ) return "Startseite /";
+  if (x === "/status") return "Status /status";
+  if (x === "/health") return "Health /health";
+  if (x.startsWith("WD ")) return "Wüstenduell " + x.slice(3);
+  return x;
+}
+function intern(ip) {
+  const x = String(ip || "").replace(/^::ffff:/, "");
+  return /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd])/i.test(x);
+}
+// Programm kurz und lesbar (z. B. "Chrome / Android", "curl", "Godot-Spiel")
+function programm(ua) {
+  if (!ua) return KEINE;
+  const u = String(ua);
+  let sys = /Android/.test(u) ? "Android" : /iPhone|iPad/.test(u) ? "iPhone" : /Windows/.test(u) ? "Windows" : /Mac OS/.test(u) ? "Mac" : /Linux/.test(u) ? "Linux" : "";
+  let br = /Edg\//.test(u) ? "Edge" : /OPR\//.test(u) ? "Opera" : /Firefox\//.test(u) ? "Firefox" : /Chrome\//.test(u) ? "Chrome" :
+    /Safari\//.test(u) ? "Safari" : /curl/i.test(u) ? "curl" : /python/i.test(u) ? "Python" : /Go-http/i.test(u) ? "Go-Programm" :
+    /Godot/i.test(u) ? "Godot-Spiel" : /bot|crawl|spider/i.test(u) ? "Bot" : u.slice(0, 30);
+  return sys ? br + " / " + sys : br;
+}
+
 class Uebersicht {
   constructor(laufKennung) {
     this.lauf = laufKennung || ""; // Kennung des aktuellen Server-Laufs (offene Sitzungen anderer Laeufe = unterbrochen)
@@ -46,6 +76,7 @@ class Uebersicht {
     this.auff = new Map(); // ip -> { geo, gruende:{grund:n}, erst, letzt, namen:Set, ua }
     this.abgel = new Map(); // ip -> { gruende:{}, erst, letzt, n }
     this.http = new Map(); // ip -> { geo, anfragen:[], n, ua, letzt }
+    this.web = new Map(); // Besuch-Kennung -> { ip, art, pfad, n, erst, letzt, geo, ua, benutzer, offen }  (Startseite / Status / Protokoll-Seite)
     this.serverStarts = [];
   }
 
@@ -95,7 +126,19 @@ class Uebersicht {
         a.gruende[g] = (a.gruende[g] || 0) + (e.unterdrueckt || 0);
         break;
       }
+      case "web_aufruf":
+      case "protokoll_zugriff":
+      case "protokoll_ohne_login":
+      case "protokoll_gesperrt":
+        this._web(e, e.art, e.pfad || "/protokoll");
+        break;
+      case "web_ende": {
+        const w = this.web.get(e.b);
+        if (w) { w.n = e.anzahl || w.n; w.letzt = e.bis || e.z; w.dauer = e.dauer_s; w.offen = false; }
+        break;
+      }
       case "abgelehnt": {
+        if (/Protokoll/.test(e.grund || "")) this._web(e, /gesperrt/.test(e.grund) ? "protokoll_sperre" : "protokoll_falsch", "/protokoll", true);
         let a = this.abgel.get(e.ip);
         if (!a) { a = { gruende: {}, erst: e.z, n: 0, geo: e.geo }; this.abgel.set(e.ip, a); }
         a.gruende[e.grund] = (a.gruende[e.grund] || 0) + 1;
@@ -120,6 +163,12 @@ class Uebersicht {
       this.sitz.set(e.sk, s);
     }
     return s;
+  }
+  // jeder Besuch / Versuch = eigene Zeile
+  _web(e, art, pfad, einzeln) {
+    const b = e.b || (e.ip + "|" + art + "|" + pfad + "|" + e.z + "|" + this.web.size);
+    this.web.set(b, { b, ip: e.ip, art, pfad, n: 1, erst: e.z, letzt: e.z, geo: e.geo, ua: e.ua,
+      benutzer: e.benutzer, offen: !einzeln && !!e.b });
   }
   _auff(ip, z) {
     let a = this.auff.get(ip);
@@ -210,6 +259,38 @@ class Uebersicht {
       L.push("  ✖ " + sp(ip, 17) + sp(a.geo, 20) + "×" + a.n + "   " + zeit(a.erst) + " – " + zeit(a.letzt) + "   " +
         Object.entries(a.gruende).map(([g, n]) => g + " ×" + n).join(", "));
     }
+
+    L.push("");
+    const webLive = live.web || new Map();
+    const webL = [...this.web.values()];
+    const prot = webL.filter((w) => w.pfad === "/protokoll").sort((a, b) => (a.erst < b.erst ? 1 : -1));
+    const sonst = webL.filter((w) => w.pfad !== "/protokoll").sort((a, b) => (a.erst < b.erst ? 1 : -1));
+    const wKopf = "  Status   Ergebnis                        Start    Ende       Dauer        Aufrufe  IP               Ort                   Programm             Benutzer";
+    const wZeile = (w) => {
+      const lv = w.offen ? webLive.get(w.b) : null;
+      const n = lv ? lv.n : w.n;
+      const letzt = lv ? lv.letzt : w.letzt;
+      const status = w.offen ? (lv ? "● LIVE " : "✗ WEG  ") : "✓ ENDE ";
+      const warn = /falsch|sperre|gesperrt/.test(w.art) ? "⚠" : " ";
+      const d = Math.round((new Date(letzt) - new Date(w.erst)) / 1000);
+      return warn + status + " " + sp(w.art === "web_aufruf" ? seitenName(w.pfad) : WEB_ARTEN[w.art] || w.art, 32) + sp(zeit(w.erst), 9) +
+        sp(w.offen && lv ? "~läuft~" : w.offen ? "~unterbr.~" : zeit(letzt), 11) + sp(dauer(d), 13) + sp("×" + n, 9) +
+        sp(w.ip, 17) + sp(intern(w.ip) ? "intern (Server-Check)" : w.geo, 22) + sp(programm(w.ua), 21) + (w.benutzer || "");
+    };
+    const zahl = (f) => prot.filter(f).length;
+    L.push("▶ 🔐 PROTOKOLL-SEITE  (jede Anmeldung / jeder Versuch auf /protokoll)   – " +
+      zahl((w) => w.art === "protokoll_zugriff") + "× angemeldet, " + zahl((w) => w.art === "protokoll_falsch") + "× falsches Passwort, " +
+      zahl((w) => w.art === "protokoll_sperre") + "× gesperrt, " + zahl((w) => w.art === "protokoll_ohne_login") + "× Login-Fenster ohne Anmeldung");
+    L.push(wKopf);
+    if (!prot.length) L.push("  keine");
+    for (const w of prot.slice(0, 150)) L.push(wZeile(w));
+    if (prot.length > 150) L.push("  … " + (prot.length - 150) + " ältere ausgeblendet");
+    L.push("");
+    L.push("▶ 🌐 STARTSEITE / STATUS  (Aufrufe von /, /status, /health, /wd)   – " + sonst.length + " Besuche von " + new Set(sonst.map((w) => w.ip)).size + " IPs");
+    L.push(wKopf);
+    if (!sonst.length) L.push("  keine");
+    for (const w of sonst.slice(0, 150)) L.push(wZeile(w));
+    if (sonst.length > 150) L.push("  … " + (sonst.length - 150) + " ältere ausgeblendet");
 
     L.push("");
     L.push("▶ ? FREMDE WEB-ANFRAGEN  (Scanner / Lücken-Suche, z. B. nach PHP)   – " + this.http.size + " IPs");
