@@ -21,6 +21,7 @@
 
 "use strict";
 const http = require("http");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
@@ -224,9 +225,10 @@ function ablehnen(socket, code, text) {
   socket.destroy();
 }
 
-function httpServer(wssX, okPfade) {
+function httpServer(wssX, okPfade, mitProtokoll) {
   const srv = http.createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
     const ip = ipVon(req);
+    if (mitProtokoll && String(req.url).split("?")[0].startsWith("/protokoll")) return protokollSeite(req, res, ip);
     // GET und HEAD (Render prueft per HEAD /, ob der Dienst laeuft)
     if ((req.method === "GET" || req.method === "HEAD") && okPfade.indexOf(String(req.url).split("?")[0]) >= 0) {
       res.writeHead(200, { "Content-Type": "text/plain" });
@@ -278,9 +280,126 @@ function httpServer(wssX, okPfade) {
   return srv;
 }
 
-const server = httpServer(wss, ["/", "/health"]);
+const server = httpServer(wss, ["/", "/health"], true);
 const WD_PORT = process.env.WD_PORT || (process.env.RENDER ? "" : "3001");
 const serverWd = WD_PORT ? httpServer(wssWd, ["/", "/wd", "/wd/", "/health"]) : null;
+
+// ------------------------------------------------------------------ Geschuetzte Protokoll-Seite  /protokoll
+// Nur aktiv, wenn PROTOKOLL_PASSWORT gesetzt ist (Oracle: /etc/haus-relay/protokoll.env, Render: Environment).
+// Anmeldung per Benutzername/Passwort (Browser-Abfrage), nur ueber https. Falsche Versuche: nach 5 in 10 min
+// wird die IP 15 min gesperrt und als auffaellig protokolliert.
+const PW = process.env.PROTOKOLL_PASSWORT || "";
+const PW_USER = process.env.PROTOKOLL_BENUTZER || "emir";
+const pwFehler = new Map(); // ip -> { n, t, bis }
+
+function hash(x) {
+  return crypto.createHash("sha256").update(String(x)).digest();
+}
+function htmlEsc(t) {
+  return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function protokollSeite(req, res, ip) {
+  const sicher = {
+    "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow", "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+  };
+  if (!PW || PW.length < 12 || req.method !== "GET") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    return res.end("not found");
+  }
+  const jetzt = Date.now();
+  let f = pwFehler.get(ip);
+  if (f && f.bis > jetzt) {
+    res.writeHead(429, Object.assign({ "Content-Type": "text/plain; charset=utf-8" }, sicher));
+    return res.end("Zu viele Fehlversuche – bitte spaeter nochmal.");
+  }
+  // Anmeldung pruefen (zeitkonstant)
+  let ok = false;
+  const auth = String(req.headers.authorization || "");
+  if (auth.startsWith("Basic ") && auth.length < 500) {
+    const roh = Buffer.from(auth.slice(6), "base64").toString("utf8");
+    const i = roh.indexOf(":");
+    if (i > 0) {
+      const u = roh.slice(0, i), p = roh.slice(i + 1);
+      ok = crypto.timingSafeEqual(hash(u), hash(PW_USER)) & crypto.timingSafeEqual(hash(p), hash(PW)) ? true : false;
+      if (!ok) {
+        if (!f || jetzt - f.t > 10 * 60000) f = { n: 0, t: jetzt, bis: 0 };
+        f.n++;
+        pwFehler.set(ip, f);
+        logBegrenzt(ip, "abgelehnt", { grund: "falsches Protokoll-Passwort", benutzer: u.slice(0, 40), geo: geo(ip), ua: String(req.headers["user-agent"] || "").slice(0, 200) });
+        if (f.n >= 5) {
+          f.bis = jetzt + 15 * 60000;
+          ipEintrag(ip).auffaellig = true;
+          logBegrenzt(ip, "abgelehnt", { grund: "Protokoll-Seite: 5 Fehlversuche – 15 min gesperrt", geo: geo(ip) });
+        }
+      }
+    }
+  }
+  if (!ok) {
+    res.writeHead(401, Object.assign({ "WWW-Authenticate": 'Basic realm="Relay-Protokoll", charset="UTF-8"', "Content-Type": "text/plain; charset=utf-8" }, sicher));
+    return res.end("Anmeldung noetig.");
+  }
+  pwFehler.delete(ip);
+  const pfad = String(req.url).split("?")[0];
+  // Tagesdatei herunterladen:  /protokoll/datei/JJJJ-MM-TT
+  let m = pfad.match(/^\/protokoll\/datei\/(\d{4}-\d{2}-\d{2})$/);
+  if (m) {
+    const text = protokollText(m[1]);
+    res.writeHead(200, Object.assign({ "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": 'attachment; filename="relay-protokoll-' + m[1] + '.txt"' }, sicher));
+    return res.end(text);
+  }
+  // Seite anzeigen:  /protokoll  oder  /protokoll/JJJJ-MM-TT
+  m = pfad.match(/^\/protokoll(?:\/(\d{4}-\d{2}-\d{2}))?\/?$/);
+  if (!m) {
+    res.writeHead(404, Object.assign({ "Content-Type": "text/plain" }, sicher));
+    return res.end("not found");
+  }
+  const tag = m[1] || heute();
+  if (!ipEintrag(ip).protokollGeloggt || jetzt - ipEintrag(ip).protokollGeloggt > 30 * 60000) {
+    ipEintrag(ip).protokollGeloggt = jetzt;
+    log("protokoll_zugriff", { ip, geo: geo(ip) });
+  }
+  const tage = protokollTage();
+  const knoepfe = tage.map((t) => '<a class="' + (t === tag ? "an" : "") + '" href="/protokoll/' + t + '">' + t.slice(8, 10) + "." + t.slice(5, 7) + ".</a>").join(" ");
+  const html = '<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+    (tag === heute() ? '<meta http-equiv="refresh" content="5">' : "") +
+    "<title>Relay-Protokoll" + (process.env.RENDER ? " (Render)" : " (Oracle)") + "</title><style>" +
+    "body{margin:0;background:#0d1117;color:#e6edf3;font:14px system-ui,sans-serif}" +
+    "header{padding:10px 14px;background:#161b22;border-bottom:1px solid #30363d;display:flex;flex-wrap:wrap;gap:8px;align-items:center}" +
+    "h1{font-size:16px;margin:0 12px 0 0}a{color:#58a6ff;text-decoration:none;padding:3px 8px;border:1px solid #30363d;border-radius:6px}" +
+    "a.an{background:#1f6feb;color:#fff}pre{margin:0;padding:12px 14px;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre;overflow-x:auto}" +
+    ".info{color:#8b949e;font-size:12px}</style></head><body><header><h1>Relay-Protokoll – " + (process.env.RENDER ? "Render" : "Oracle") + "</h1>" +
+    knoepfe + ' <a href="/protokoll/datei/' + tag + '">⬇ Datei</a><span class="info">' +
+    (tag === heute() ? "aktualisiert sich alle 5 s" : "") + "</span></header><pre>" + htmlEsc(protokollText(tag)) + "</pre></body></html>";
+  res.writeHead(200, Object.assign({ "Content-Type": "text/html; charset=utf-8" }, sicher));
+  res.end(html);
+}
+
+function protokollTage() {
+  const t = new Set([heute()]);
+  if (logAufPlatte) {
+    try {
+      for (const f of fs.readdirSync(LOG_DIR)) if (/^\d{4}-\d{2}-\d{2}\.log$/.test(f)) t.add(f.slice(0, 10));
+    } catch (e) {}
+  }
+  return [...t].sort().reverse().slice(0, LOG_TAGE + 1);
+}
+
+function protokollText(tag) {
+  if (tag === heute() || !logAufPlatte) return ueb.text({ live: liveDaten() });
+  const u = new Uebersicht("seite");
+  try {
+    for (const z of fs.readFileSync(path.join(LOG_DIR, tag + ".log"), "utf8").split("\n")) {
+      if (!z) continue;
+      try { u.ereignis(JSON.parse(z)); } catch (e) {}
+    }
+  } catch (e) {
+    return "Kein Protokoll fuer " + tag;
+  }
+  return u.text({ titel: tag });
+}
 
 // ------------------------------------------------------------------ Hilfen
 function neuerCode() {
