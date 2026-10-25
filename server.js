@@ -229,6 +229,7 @@ function httpServer(wssX, okPfade, mitProtokoll) {
   const srv = http.createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
     const ip = ipVon(req);
     if (mitProtokoll && String(req.url).split("?")[0].startsWith("/protokoll")) return protokollSeite(req, res, ip);
+    if (mitProtokoll && req.method === "GET" && String(req.url).split("?")[0] === "/status") return statusSeite(res);
     // GET und HEAD (Render prueft per HEAD /, ob der Dienst laeuft)
     if ((req.method === "GET" || req.method === "HEAD") && okPfade.indexOf(String(req.url).split("?")[0]) >= 0) {
       res.writeHead(200, { "Content-Type": "text/plain" });
@@ -283,6 +284,92 @@ function httpServer(wssX, okPfade, mitProtokoll) {
 const server = httpServer(wss, ["/", "/health"], true);
 const WD_PORT = process.env.WD_PORT || (process.env.RENDER ? "" : "3001");
 const serverWd = WD_PORT ? httpServer(wssWd, ["/", "/wd", "/wd/", "/health"]) : null;
+
+// ------------------------------------------------------------------ Oeffentlicher Kurzstatus  /status
+// Nur Zahlen und Sicherheits-Pruefungen – KEINE IPs, Namen, Raeume, Chat. Fuer die woechentliche Pruefung.
+// Ergebnis wird 10 min zwischengespeichert (Abruf kostet den Server praktisch nichts).
+const os = require("os");
+const START_ZEIT = Date.now();
+let statusCache = null, statusZeit = 0;
+
+function zaehle(u, z) {
+  for (const s of u.sitz.values()) {
+    const g = s.spiel || "ohne";
+    const e = z.spiele[g] || (z.spiele[g] = { sitzungen: 0, raeume: new Set() });
+    if (s.raum) { e.sitzungen++; e.raeume.add(s.raum); }
+  }
+  for (const a of u.auff.values()) {
+    z.auffaellig_ips++;
+    for (const [g, n] of Object.entries(a.gruende)) z.auffaellig_gruende[g] = (z.auffaellig_gruende[g] || 0) + n;
+  }
+  for (const a of u.abgel.values()) {
+    z.abgelehnt_ips++;
+    for (const [g, n] of Object.entries(a.gruende)) z.abgelehnt_gruende[g] = (z.abgelehnt_gruende[g] || 0) + n;
+  }
+  for (const h of u.http.values()) { z.web_scanner_ips++; z.web_scanner_anfragen += h.n; }
+  z.server_starts += u.serverStarts.length;
+}
+
+function sicherheit() {
+  const c = {};
+  try { c.laeuft_als = os.userInfo().username; } catch (e) { c.laeuft_als = "?"; }
+  c.als_root = typeof process.getuid === "function" ? process.getuid() === 0 : false;
+  c.node = process.version;
+  c.protokoll_auf_platte = logAufPlatte;
+  if (logAufPlatte) {
+    try { c.protokoll_ordner_rechte = (fs.statSync(LOG_DIR).mode & 0o777).toString(8); } catch (e) {}
+  }
+  c.protokoll_seite_aktiv = PW.length >= 12;
+  try {
+    const sshd = fs.readFileSync("/etc/ssh/sshd_config", "utf8");
+    const m = sshd.match(/^\s*PasswordAuthentication\s+(\w+)/im);
+    c.ssh_passwort_login = m ? m[1] : "standard";
+  } catch (e) {}
+  c.php_installiert = ["/usr/bin/php", "/usr/local/bin/php"].some((f) => fs.existsSync(f));
+  try {
+    const d = fs.statfsSync(logAufPlatte ? LOG_DIR : "/");
+    c.platte_frei_gb = Math.round((d.bavail * d.bsize) / 1e8) / 10;
+  } catch (e) {}
+  c.ram_frei_mb = Math.round(os.freemem() / 1048576);
+  c.ram_relay_mb = Math.round(process.memoryUsage().rss / 1048576);
+  return c;
+}
+
+function statusSeite(res) {
+  if (!statusCache || Date.now() - statusZeit > 10 * 60 * 1000) {
+    const z = { spiele: {}, auffaellig_ips: 0, auffaellig_gruende: {}, abgelehnt_ips: 0, abgelehnt_gruende: {},
+      web_scanner_ips: 0, web_scanner_anfragen: 0, server_starts: 0 };
+    const tage = [];
+    for (const tag of protokollTage()) {
+      if (tag === heute() || !logAufPlatte) { zaehle(ueb, z); tage.push(tag); continue; }
+      const u = new Uebersicht("status");
+      try {
+        for (const zl of fs.readFileSync(path.join(LOG_DIR, tag + ".log"), "utf8").split("\n")) {
+          if (!zl) continue;
+          try { u.ereignis(JSON.parse(zl)); } catch (e) {}
+        }
+        zaehle(u, z);
+        tage.push(tag);
+      } catch (e) {}
+    }
+    const spiele = {};
+    for (const [g, e] of Object.entries(z.spiele)) spiele[g] = { sitzungen: e.sitzungen, raeume: e.raeume.size };
+    statusCache = JSON.stringify({
+      ok: true, server: process.env.RENDER ? "render" : "oracle", stand: new Date().toISOString(),
+      laeuft_seit_h: Math.round((Date.now() - START_ZEIT) / 360000) / 10,
+      zeitraum: tage.length ? tage[tage.length - 1] + " bis " + tage[0] : "",
+      jetzt_online: anzahlClients(), raeume_offen: raeume.size + raeumeWd.size,
+      wuestenduell_port: serverWd ? Number(WD_PORT) : null,
+      spiele, auffaellig_ips: z.auffaellig_ips, auffaellig_gruende: z.auffaellig_gruende,
+      abgelehnt_ips: z.abgelehnt_ips, abgelehnt_gruende: z.abgelehnt_gruende,
+      web_scanner_ips: z.web_scanner_ips, web_scanner_anfragen: z.web_scanner_anfragen,
+      server_starts: z.server_starts, sicherheit: sicherheit(),
+    }, null, 2);
+    statusZeit = Date.now();
+  }
+  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(statusCache);
+}
 
 // ------------------------------------------------------------------ Geschuetzte Protokoll-Seite  /protokoll
 // Nur aktiv, wenn PROTOKOLL_PASSWORT gesetzt ist (Oracle: /etc/haus-relay/protokoll.env, Render: Environment).
