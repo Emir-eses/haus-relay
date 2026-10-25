@@ -1,9 +1,9 @@
 {
-  "name": "haus-spiel-relay",
-  "version": "1.0.0",
-  "description": "Relay-Server fuer das Haus-Spiel",
+  "name": "haus-relay",
+  "version": "3.0.0",
+  "description": "Relay-Server fuer THE HOUSE, HORRORMARKT und DOENER DER TOTEN (mit Schutz und Sicherheitsprotokoll)",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "ws": "^8.18.0" }
+  "scripts": { "start": "node server.js", "bericht": "node bericht.js" },
+  "dependencies": { "ws": "^8.18.0" },
+  "optionalDependencies": { "geoip-lite": "^1.4.10" }
 }
