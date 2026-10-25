@@ -227,9 +227,10 @@ function ablehnen(socket, code, text) {
 function httpServer(wssX, okPfade) {
   const srv = http.createServer({ maxHeaderSize: 16 * 1024 }, (req, res) => {
     const ip = ipVon(req);
-    if (req.method === "GET" && okPfade.indexOf(String(req.url).split("?")[0]) >= 0) {
+    // GET und HEAD (Render prueft per HEAD /, ob der Dienst laeuft)
+    if ((req.method === "GET" || req.method === "HEAD") && okPfade.indexOf(String(req.url).split("?")[0]) >= 0) {
       res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
+      res.end(req.method === "HEAD" ? undefined : "ok");
       return;
     }
     // Scanner/Angreifer suchen hier nach Luecken (z. B. /wp-login.php, /.env, PHP-Uploads) – mitschreiben, Body nie lesen
