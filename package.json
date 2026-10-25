@@ -4,6 +4,7 @@
   "description": "Relay-Server fuer THE HOUSE, HORRORMARKT und DOENER DER TOTEN (mit Schutz und Sicherheitsprotokoll)",
   "main": "server.js",
   "scripts": { "start": "node server.js", "bericht": "node bericht.js" },
+  "engines": { "node": ">=24" },
   "dependencies": { "ws": "^8.18.0" },
-  "optionalDependencies": { "geoip-lite": "^1.4.10" }
+  "optionalDependencies": { "geoip-lite": "^2.0.3" }
 }

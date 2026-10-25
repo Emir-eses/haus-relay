@@ -139,9 +139,12 @@ function logBegrenzt(ip, art, daten) {
 }
 
 function geo(ip) {
-  if (!geoip) return undefined;
+  if (!geoip || typeof ip !== "string") return undefined;
+  ip = ip.replace(/^::ffff:/, "");
+  // nur saubere IP-Adressen an die Bibliothek geben (Schutz vor praeparierten, ueberlangen Eingaben)
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && !(ip.length <= 39 && /^[0-9a-fA-F:]+$/.test(ip))) return undefined;
   try {
-    const g = geoip.lookup(ip.replace(/^::ffff:/, ""));
+    const g = geoip.lookup(ip);
     if (!g) return undefined;
     const land = { AT: "Österreich", DE: "Deutschland", CH: "Schweiz", TR: "Türkei", US: "USA" }[g.country] || g.country;
     const bl = g.country === "AT" ? { 1: "Burgenland", 2: "Kärnten", 3: "NÖ", 4: "OÖ", 5: "Salzburg", 6: "Steiermark", 7: "Tirol", 8: "Vorarlberg", 9: "Wien" }[g.region] : g.region;
